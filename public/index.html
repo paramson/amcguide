@@ -74,6 +74,7 @@ table.dt td.ref{color:var(--muted);font-variant-numeric:tabular-nums}
 </head>
 <body>
 <div id="app"></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* ============================ DATA ============================ */
 var GROUPS = {
@@ -173,6 +174,105 @@ function selectNext(answered,theta,mode,seen){
 
 /* ============================ STATE ============================ */
 var state={screen:"login",user:null,mode:"practice",answered:[],choice:null,revealed:false,current:null,last:null,openReview:null,detailOpen:false,timer:null,examRemaining:0,elapsed:0};
+/* ===== Supabase integration (Phase 2) ===== */
+var SB_URL = "https://afmftsyroenfikqrltqt.supabase.co";  /* <-- replace with your Project URL */
+var SB_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFmbWZ0c3lyb2VuZmlrcXJsdHF0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEzODM3ODAsImV4cCI6MjA5Njk1OTc4MH0.gsJQge--tmqcRI-W8_eMk3n0cfvJ3HoZYlOqO035FnE";                     /* <-- replace with your anon public key */
+var DB = {
+  client:null, user:null, ready:false,
+  init:function(){
+    var self=this;
+    return Promise.resolve().then(function(){
+      if(!window.supabase || !SB_URL || SB_URL.indexOf("YOUR-")>-1) return;
+      self.client = window.supabase.createClient(SB_URL, SB_ANON);
+      self.client.auth.onAuthStateChange(function(_e, session){ DB.user = session ? session.user : null; });
+      return self.client.auth.getSession().then(function(r){
+        self.user = (r && r.data && r.data.session) ? r.data.session.user : null;
+        self.ready = true;
+      });
+    }).catch(function(e){ console.warn("Supabase init failed", e); });
+  },
+  loggedIn:function(){ return !!this.user; },
+  signInMagic:function(email){
+    return this.client.auth.signInWithOtp({ email: email, options:{ emailRedirectTo: window.location.origin } });
+  },
+  signOut:function(){ var c=this.client; this.user=null; if(c){ try{ return c.auth.signOut(); }catch(e){} } return Promise.resolve(); },
+  saveSession:function(summary, answered){
+    if(!this.client || !this.user) return Promise.resolve();
+    var uid=this.user.id;
+    return this.client.from('sessions').insert({
+      user_id:uid, mode:summary.mode, n_items:summary.n, n_correct:summary.nCorrect,
+      theta:summary.theta, score:summary.score, started_at:summary.startedAt, finished_at:new Date().toISOString()
+    }).select('id').single().then(function(ins){
+      var sid = (ins && ins.data) ? ins.data.id : null;
+      var rows = answered.map(function(a){
+        var q=QUESTIONS.find(function(z){return z.id===a.qid;});
+        return { user_id:uid, session_id:sid, item_id:a.qid, patient_group:a.group,
+          clinician_task: q?q.task:null, difficulty:a.b, selected:a.choice, correct:a.correct,
+          theta_after:summary.theta, mode:summary.mode };
+      });
+      if(rows.length) return DB.client.from('responses').insert(rows);
+    }).catch(function(e){ console.warn("saveSession failed", e); });
+  },
+  loadHistory:function(){
+    if(!this.client || !this.user) return Promise.resolve(null);
+    var uid=this.user.id;
+    return Promise.all([
+      this.client.from('sessions').select('mode,n_items,n_correct,theta,score,finished_at').eq('user_id',uid).order('finished_at',{ascending:true}),
+      this.client.from('responses').select('patient_group,clinician_task,correct').eq('user_id',uid)
+    ]).then(function(res){
+      return { sessions:(res[0]&&res[0].data)||[], responses:(res[1]&&res[1].data)||[] };
+    }).catch(function(e){ console.warn("loadHistory failed", e); return null; });
+  }
+};
+function loadDashboard(){
+  var el=document.getElementById("dashboard"); if(!el) return;
+  el.innerHTML='<div class="card" style="padding:18px;margin-top:12px"><div class="eyebrow">Your progress</div><p style="color:var(--muted);font-size:13px;margin-top:6px">Loading...</p></div>';
+  DB.loadHistory().then(function(h){
+    var e2=document.getElementById("dashboard"); if(!e2) return;
+    if(!h || !h.sessions || !h.sessions.length){ e2.innerHTML=dashEmptyHTML(); return; }
+    e2.innerHTML=dashHTML(h); animateMeters();
+  });
+}
+function dashEmptyHTML(){
+  return '<div class="card" style="padding:18px;margin-top:12px"><div class="eyebrow">Your progress</div><p style="color:var(--muted);font-size:14px;margin-top:6px">No saved sessions yet. Finish a mock or a practice set and your ability trend, accuracy by group and clinician task will build up here.</p></div>';
+}
+function trendSVG(scores){
+  var W=320,H=90,pad=10,n=scores.length,max=500,min=0;
+  function x(i){ return n<=1 ? W/2 : pad + i*(W-2*pad)/(n-1); }
+  function y(v){ return H-pad - (v-min)/(max-min)*(H-2*pad); }
+  var pts=scores.map(function(s,i){return x(i).toFixed(1)+','+y(s).toFixed(1);}).join(' ');
+  var passY=y(250).toFixed(1);
+  var dots=scores.map(function(s,i){return '<circle cx="'+x(i).toFixed(1)+'" cy="'+y(s).toFixed(1)+'" r="3" fill="var(--primary)"/>';}).join('');
+  return '<svg viewBox="0 0 '+W+' '+H+'" width="100%" height="90" aria-hidden="true">'
+   +'<line x1="0" y1="'+passY+'" x2="'+W+'" y2="'+passY+'" stroke="var(--amber)" stroke-width="1" stroke-dasharray="4 4"/>'
+   +'<polyline points="'+pts+'" fill="none" stroke="var(--primary)" stroke-width="2"/>'+dots+'</svg>';
+}
+function dashBar(label,c,nn){ var p=nn?Math.round(c/nn*100):0; var col=p>=75?'var(--correct)':(p>=50?'var(--amber)':'var(--incorrect)');
+  return '<div style="margin:9px 0"><div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:3px"><span>'+esc(label)+'</span><span style="color:var(--muted)">'+p+'% &middot; '+c+'/'+nn+'</span></div><div style="height:8px;background:var(--paper);border:1px solid var(--line);border-radius:99px;overflow:hidden"><div style="height:100%;width:'+p+'%;background:'+col+'"></div></div></div>'; }
+function dashHTML(h){
+  var sess=h.sessions, resp=h.responses;
+  var scores=sess.map(function(s){return s.score||0;});
+  var latest=scores.length?scores[scores.length-1]:0;
+  var totalQ=resp.length;
+  var TASKL={data_gathering:'Data gathering',data_interpretation:'Data interpretation',management:'Management'};
+  var byG={}, byT={};
+  resp.forEach(function(r){
+    var g=r.patient_group||'other'; byG[g]=byG[g]||{c:0,n:0}; byG[g].n++; if(r.correct)byG[g].c++;
+    var t=r.clinician_task||'management'; byT[t]=byT[t]||{c:0,n:0}; byT[t].n++; if(r.correct)byT[t].c++;
+  });
+  function glabel(g){ return (typeof GROUPS!=='undefined' && GROUPS[g] && GROUPS[g].label) ? GROUPS[g].label : g; }
+  var groupBars=Object.keys(byG).sort(function(a,b){return (byG[a].c/byG[a].n)-(byG[b].c/byG[b].n);}).map(function(g){return dashBar(glabel(g),byG[g].c,byG[g].n);}).join('');
+  var taskBars=Object.keys(TASKL).filter(function(t){return byT[t];}).map(function(t){return dashBar(TASKL[t],byT[t].c,byT[t].n);}).join('');
+  return '<div class="card" style="padding:18px;margin-top:12px">'
+    +'<div class="row"><div class="eyebrow">Your progress</div><span style="font-size:12px;color:var(--muted)">'+sess.length+' sessions &middot; '+totalQ+' questions</span></div>'
+    +'<div style="display:flex;align-items:baseline;gap:8px;margin-top:6px"><span class="serif" style="font-size:26px">'+latest+'</span><span style="font-size:12px;color:var(--muted)">latest ability score / 500</span></div>'
+    +'<div style="margin-top:8px">'+trendSVG(scores)+'</div>'
+    +'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;margin-top:8px">'
+      +'<div><div class="eyebrow" style="margin-bottom:4px">Accuracy by patient group</div>'+groupBars+'</div>'
+      +'<div><div class="eyebrow" style="margin-bottom:4px">Accuracy by clinician task</div>'+taskBars+'</div>'
+    +'</div></div>';
+}
+
 function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 var EXAM_LENGTH=50; /* set to 150 for a full AMC-length mock; capped at bank size */
 var examLen=Math.min(EXAM_LENGTH,QUESTIONS.length);
@@ -271,7 +371,7 @@ function loginHTML(){
      +'<button class="btn" style="width:100%" onclick="continueLogin()">Continue</button>'
      +'<div style="text-align:center;margin-top:12px"><button class="ghost" onclick="guestLogin()">Continue as guest</button></div>'
    +'</div>'
-   +'<p style="font-size:12px;color:var(--muted);margin-top:14px;max-width:440px">Demo sign-in (in-memory). Production uses Supabase Auth with email and Google sign-in.</p>'
+   +'<p id="authMsg" style="font-size:13px;color:var(--primary);margin-top:12px;max-width:440px"></p>'+'<p style="font-size:12px;color:var(--muted);margin-top:8px;max-width:440px">We email you a one-tap sign-in link - no password. Your results and progress are saved to your account. Continue as guest to try without saving.</p>'
    +'</div></div>';
 }
 function homeHTML(){
@@ -280,7 +380,7 @@ function homeHTML(){
    +'<div class="row"><div class="eyebrow">Signed in &middot; '+esc(state.user)+'</div><button class="ghost" onclick="signOut()">Sign out</button></div>'
    +'<h1 style="font-size:30px;margin:10px 0 4px">Choose how you want to practise</h1>'
    +'<p style="color:var(--muted)">'+QUESTIONS.length+' questions across all six AMC patient groups.</p>'
-   +lastBlock
+   +lastBlock+'<div id="dashboard"></div>'
    +'<div class="card modecard" style="padding:22px;margin-top:18px" onclick="startMode(\'exam\')">'
    +'<div class="eyebrow" style="color:var(--primary)">Exam simulation</div>'
    +'<h2 style="font-size:21px;margin:6px 0">Sit a timed adaptive mini-mock</h2>'
@@ -393,7 +493,7 @@ function resultsHTML(){
 function render(){
   var app=document.getElementById("app");
   if(state.screen==="login") app.innerHTML=loginHTML();
-  else if(state.screen==="home"){app.innerHTML=homeHTML();animateMeters();}
+  else if(state.screen==="home"){app.innerHTML=homeHTML();animateMeters();if(DB.loggedIn())loadDashboard();}
   else if(state.screen==="run") app.innerHTML=runHTML();
   else if(state.screen==="results"){app.innerHTML=resultsHTML();animateMeters();}
 }
@@ -404,15 +504,15 @@ function startTimer(){stopTimer();state.elapsed=0;if(state.mode==="exam")state.e
 function tick(){state.elapsed++;if(state.mode==="exam"){state.examRemaining--;if(state.examRemaining<=0){stopTimer();finish();return;}}var el=document.getElementById("timer");if(el){if(state.mode==="exam"){el.textContent=formatTime(state.examRemaining);if(state.examRemaining<=60)el.classList.add("low");else el.classList.remove("low");}else{el.textContent=formatTime(state.elapsed);}}}
 
 /* ============================ ACTIONS ============================ */
-function continueLogin(){var v=document.getElementById("emailInput").value;state.user=v||"candidate";state.screen="home";render();}
+function continueLogin(){var v=document.getElementById("emailInput").value;if(!v)return;if(DB.ready&&DB.client){DB.signInMagic(v).then(function(res){var b=document.getElementById("authMsg");if(b)b.textContent=(res&&res.error)?("Could not send link: "+res.error.message):("Check your email - we sent a one-tap sign-in link to "+v+".");}).catch(function(){var b=document.getElementById("authMsg");if(b)b.textContent="Sign-in unavailable right now - try Continue as guest.";});}else{state.user=v||"candidate";state.screen="home";render();}}
 function guestLogin(){state.user="guest";state.screen="home";render();}
-function signOut(){stopTimer();state.user=null;state.last=null;state.screen="login";render();}
+function signOut(){stopTimer();DB.signOut();state.user=null;state.last=null;state.screen="login";render();}
 function pickNext(){
   var theta=estimateTheta(state.answered.map(function(a){return {b:a.b,correct:a.correct};})).theta;
   var seen={}; state.answered.forEach(function(a){seen[a.group]=(seen[a.group]||0)+1;});
   state.current=selectNext(state.answered,theta,state.mode,seen);
 }
-function startMode(m){state.mode=m;state.answered=[];state.choice=null;state.revealed=false;state.openReview=null;state.detailOpen=false;pickNext();startTimer();state.screen="run";render();}
+function startMode(m){state.mode=m;state.answered=[];state.choice=null;state.revealed=false;state.openReview=null;state.detailOpen=false;state.startedAt=new Date().toISOString();pickNext();startTimer();state.screen="run";render();}
 function selectOpt(id){if(state.mode==="practice"&&state.revealed)return;state.choice=id;render();}
 function submit(){
   if(!state.choice)return;
@@ -425,14 +525,14 @@ function submit(){
   if(!state.current){finish();return;}
   render();
 }
-function finish(){stopTimer();if(!state.answered.length){state.screen="home";render();return;}var th=estimateTheta(state.answered.map(function(a){return {b:a.b,correct:a.correct};})).theta;state.last={mode:state.mode,score:thetaToScore(th)};state.screen="results";render();}
+function finish(){stopTimer();if(!state.answered.length){state.screen="home";render();return;}var th=estimateTheta(state.answered.map(function(a){return {b:a.b,correct:a.correct};})).theta;var score=thetaToScore(th);state.last={mode:state.mode,score:score};if(DB.loggedIn()){DB.saveSession({mode:state.mode,n:state.answered.length,nCorrect:state.answered.filter(function(a){return a.correct;}).length,theta:th,score:score,startedAt:state.startedAt||null},state.answered);}state.screen="results";render();}
 function goHomeFromRun(){if(state.mode==="exam"&&state.answered.length>0){if(!confirm("Leave the exam? Your progress will be lost."))return;}stopTimer();state.screen="home";render();}
 function again(){startMode(state.mode);}
 function goHome(){stopTimer();state.screen="home";render();}
 function toggleReview(i){state.openReview=state.openReview===i?null:i;render();}
 function toggleDetail(){var b=document.getElementById("detailBlock"),btn=document.getElementById("detailBtn");if(!b)return;var open=b.style.display==="none";b.style.display=open?"block":"none";btn.innerHTML=open?"&minus; Hide full breakdown":"&#43; Show full breakdown";if(open)b.scrollIntoView({behavior:"smooth",block:"nearest"});}
 
-render();
+(function(){DB.init().then(function(){if(DB.loggedIn()){state.user=DB.user.email||"candidate";state.screen="home";}render();});})();
 </script>
 </body>
 </html>

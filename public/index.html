@@ -152,7 +152,8 @@ function targetCounts(len){
 }
 function selectNext(answered,theta,mode,seen){
   var used=answered.map(function(a){return a.qid;});
-  var rem=QUESTIONS.filter(function(q){return used.indexOf(q.id)<0;});
+  var rem=QUESTIONS.filter(function(q){return used.indexOf(q.id)<0 && !SEEN[q.id];});
+  if(!rem.length){ clearSeen(); rem=QUESTIONS.filter(function(q){return used.indexOf(q.id)<0;}); }
   if(!rem.length) return null;
   if(mode==="exam"){
     var tgt=targetCounts(examLen);
@@ -174,6 +175,13 @@ function selectNext(answered,theta,mode,seen){
 
 /* ============================ STATE ============================ */
 var state={screen:"login",user:null,mode:"practice",answered:[],choice:null,revealed:false,current:null,last:null,openReview:null,detailOpen:false,timer:null,examRemaining:0,elapsed:0};
+/* ===== cross-session 'seen' tracking so each new mock pulls fresh items ===== */
+var SEEN = {};
+function seenKey(){ return 'amc_seen_' + ((DB&&DB.user&&DB.user.email)||state.user||'guest'); }
+function loadSeen(){ try{ var r=localStorage.getItem(seenKey()); SEEN = r?JSON.parse(r):{}; }catch(e){ SEEN={}; } }
+function persistSeen(){ try{ localStorage.setItem(seenKey(), JSON.stringify(SEEN)); }catch(e){} }
+function markSeen(id){ SEEN[id]=1; persistSeen(); }
+function clearSeen(){ SEEN={}; persistSeen(); }
 /* ===== Supabase integration (Phase 2) ===== */
 var SB_URL = "https://afmftsyroenfikqrltqt.supabase.co";  /* <-- replace with your Project URL */
 var SB_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFmbWZ0c3lyb2VuZmlrcXJsdHF0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEzODM3ODAsImV4cCI6MjA5Njk1OTc4MH0.gsJQge--tmqcRI-W8_eMk3n0cfvJ3HoZYlOqO035FnE";                     /* <-- replace with your anon public key */
@@ -192,6 +200,8 @@ var DB = {
     }).catch(function(e){ console.warn("Supabase init failed", e); });
   },
   loggedIn:function(){ return !!this.user; },
+  loadSeenIds:function(){ if(!this.client||!this.user) return Promise.resolve([]); return this.client.from('responses').select('item_id').eq('user_id',this.user.id).then(function(r){ return (r.data||[]).map(function(x){return x.item_id;}); }).catch(function(){ return []; }); },
+  sendMessage:function(payload){ if(!this.client) return Promise.resolve({error:{message:'Messaging is not configured.'}}); var row={ email:payload.email||null, name:payload.name||null, topic:payload.topic||null, item_id:payload.item_id||null, body:payload.body }; if(this.user) row.user_id=this.user.id; return this.client.from('messages').insert(row); },
   signInMagic:function(email){
     return this.client.auth.signInWithOtp({ email: email, options:{ emailRedirectTo: window.location.origin } });
   },
@@ -475,7 +485,9 @@ function loginHTML(){
      +'<div style="text-align:center;margin-top:12px"><button class="ghost" onclick="guestLogin()">Continue as guest</button></div>'
    +'</div>'
    +'<p id="authMsg" style="font-size:13px;color:var(--primary);margin-top:12px;max-width:440px"></p>'+'<p style="font-size:12px;color:var(--muted);margin-top:8px;max-width:440px">We email you a one-tap sign-in link - no password. Your results and progress are saved to your account. Continue as guest to try without saving.</p>'
-   +'</div></div>';
+   +'</div>'
+   +'<div class="card" style="padding:20px;margin-top:18px">'+'<div class="eyebrow" style="margin-bottom:4px">Questions about an explanation?</div>'+'<p style="font-size:13px;color:var(--muted);margin:0 0 12px">Stuck on why an answer is right, or want something clarified? Send it to the team and we will get back to you. <b>1:1 mentoring and live case discussions are coming soon.</b></p>'+'<input id="cName" class="input" style="margin-bottom:8px" type="text" placeholder="Your name (optional)"/>'+'<input id="cEmail" class="input" style="margin-bottom:8px" type="email" placeholder="Email so we can reply"/>'+'<textarea id="cBody" class="input" style="margin-bottom:10px;min-height:90px;resize:vertical" placeholder="Your question..."></textarea>'+'<button class="btn" style="width:100%" onclick="submitContact(\'landing\')">Send to the team</button>'+'<p id="cMsg" style="font-size:13px;color:var(--primary);margin-top:10px"></p>'+'<p style="font-size:11px;color:var(--muted);margin-top:6px">Educational guidance only - not personal medical or clinical advice. We aim to reply within a few days.</p>'+'</div>'
+   +'</div>';
 }
 function homeHTML(){
   var lastBlock = state.last ? '<div class="card" style="padding:18px;margin-top:8px"><div class="eyebrow" style="margin-bottom:8px">Your last '+(state.last.mode==="exam"?"exam":"practice")+' result</div>'+meterHTML(state.last.score)+'</div>' : '';
@@ -572,8 +584,8 @@ function resultsHTML(){
 
   var topicBlock='';
   if(missList.length){
-    var chips=missList.map(function(s){return '<span class="chip" style="margin:3px 4px 0 0">'+esc(s)+' &middot; '+miss[s]+'</span>';}).join("");
-    topicBlock='<div class="card" style="padding:18px;margin-top:16px"><div class="eyebrow" style="margin-bottom:6px">Topics to review</div><p style="font-size:13px;color:var(--muted);margin:0 0 8px">Systems where you missed at least one question this session.</p><div style="display:flex;flex-wrap:wrap">'+chips+'</div></div>';
+    var chips=missList.map(function(s){return '<span style="display:inline-flex;align-items:center;white-space:nowrap;padding:4px 10px;border-radius:999px;background:var(--paper);border:1px solid var(--line);font-size:13px;font-weight:600;color:var(--ink)">'+esc(s)+' &middot; '+miss[s]+'</span>';}).join("");
+    topicBlock='<div class="card" style="padding:18px;margin-top:16px"><div class="eyebrow" style="margin-bottom:6px">Topics to review</div><p style="font-size:13px;color:var(--muted);margin:0 0 8px">Systems where you missed at least one question this session.</p><div style="display:flex;flex-wrap:wrap;gap:8px">'+chips+'</div></div>';
   }
 
   var review=a.map(function(x,i){
@@ -590,6 +602,7 @@ function resultsHTML(){
    +meterCard
    +radarBlock+taskBlock+focusBlock+topicBlock
    +'<div class="card" style="padding:8px;margin-top:16px"><div class="eyebrow" style="padding:10px 12px 4px">Review every question</div>'+review+'</div>'
+   +'<div class="card" style="padding:18px;margin-top:16px"><div class="eyebrow" style="margin-bottom:4px">Have a question about any of these?</div><p style="font-size:13px;color:var(--muted);margin:0 0 10px">Ask the team about an explanation and we will reply by email. 1:1 mentoring is coming soon.</p><input id="rEmail" class="input" style="margin-bottom:8px" type="email" placeholder="Email so we can reply" value="'+esc((DB.user&&DB.user.email)||'')+'"/><textarea id="rBody" class="input" style="margin-bottom:10px;min-height:80px;resize:vertical" placeholder="Your question..."></textarea><button class="btn" style="width:100%" onclick="submitContact(\'results\')">Send to the team</button><p id="rMsg" style="font-size:13px;color:var(--primary);margin-top:10px"></p></div>'
    +'<div style="display:flex;gap:12px;margin-top:20px"><button class="btn" onclick="again()">Practise again</button><button class="ghost" onclick="goHome()">Back to home</button></div>'
    +'</div>';
 }
@@ -620,13 +633,14 @@ function pickNext(){
   var seen={}; state.answered.forEach(function(a){seen[a.group]=(seen[a.group]||0)+1;});
   state.current=selectNext(state.answered,theta,state.mode,seen);
 }
-function startMode(m){state.mode=m;state.answered=[];state.choice=null;state.revealed=false;state.openReview=null;state.detailOpen=false;state.startedAt=new Date().toISOString();pickNext();startTimer();state.screen="run";render();}
+function startMode(m){loadSeen();state.mode=m;state.answered=[];state.choice=null;state.revealed=false;state.openReview=null;state.detailOpen=false;state.startedAt=new Date().toISOString();pickNext();startTimer();state.screen="run";render();}
 function selectOpt(id){if(state.mode==="practice"&&state.revealed)return;state.choice=id;render();}
 function submit(){
   if(!state.choice)return;
   if(state.mode==="practice"&&!state.revealed){state.revealed=true;render();return;}
   var q=state.current,correct=state.choice===q.answer;
   state.answered.push({qid:q.id,group:q.group,b:q.difficulty,correct:correct,choice:state.choice});
+  markSeen(q.id);
   state.choice=null;state.revealed=false;state.detailOpen=false;
   if(state.mode==="exam"&&state.answered.length>=examLen){finish();return;}
   pickNext();
@@ -640,7 +654,22 @@ function goHome(){stopTimer();state.screen="home";render();}
 function toggleReview(i){state.openReview=state.openReview===i?null:i;render();}
 function toggleDetail(){var b=document.getElementById("detailBlock"),btn=document.getElementById("detailBtn");if(!b)return;var open=b.style.display==="none";b.style.display=open?"block":"none";btn.innerHTML=open?"&minus; Hide full breakdown":"&#43; Show full breakdown";if(open)b.scrollIntoView({behavior:"smooth",block:"nearest"});}
 
-(function(){DB.init().then(function(){if(DB.loggedIn()){state.user=DB.user.email||"candidate";state.screen="home";}render();});})();
+function submitContact(where){
+  var pre = (where==='results') ? 'r' : 'c';
+  function val(id){ var el=document.getElementById(id); return el?el.value:''; }
+  var name=val(pre+'Name'), email=val(pre+'Email'), body=val(pre+'Body');
+  var msg=document.getElementById(pre+'Msg');
+  if(!body.trim()){ if(msg)msg.textContent='Please type your question first.'; return; }
+  if(!email.trim()){ if(msg)msg.textContent='Please add an email so we can reply.'; return; }
+  if(msg)msg.textContent='Sending...';
+  if(DB.ready&&DB.client){
+    DB.sendMessage({name:name,email:email,body:body,topic:where}).then(function(res){
+      if(res&&res.error){ if(msg)msg.textContent='Could not send - '+res.error.message; }
+      else { if(msg)msg.textContent='Thanks - your question is with the team. We will reply by email.'; var b=document.getElementById(pre+'Body'); if(b)b.value=''; }
+    }).catch(function(){ if(msg)msg.textContent='Could not send right now - please try again later.'; });
+  } else { if(msg)msg.textContent='Messaging is not available right now.'; }
+}
+(function(){DB.init().then(function(){if(DB.loggedIn()){state.user=DB.user.email||"candidate";state.screen="home";}loadSeen();if(DB.loggedIn()){DB.loadSeenIds().then(function(ids){ids.forEach(function(id){SEEN[id]=1;});persistSeen();});}render();});})();
 </script>
 </body>
 </html>

@@ -222,6 +222,16 @@ var DB = {
     ]).then(function(res){
       return { sessions:(res[0]&&res[0].data)||[], responses:(res[1]&&res[1].data)||[] };
     }).catch(function(e){ console.warn("loadHistory failed", e); return null; });
+  },
+  loadSR:function(){
+    if(!this.client || !this.user) return Promise.resolve({});
+    return this.client.from('sr_state').select('card_id,ease,interval_days,reps,lapses,due_at,last_reviewed').eq('user_id',this.user.id).then(function(r){
+      var map={}; ((r&&r.data)||[]).forEach(function(row){ map[row.card_id]=row; }); return map;
+    }).catch(function(e){ console.warn("loadSR failed", e); return {}; });
+  },
+  saveSR:function(cardId, sr){
+    if(!this.client || !this.user) return Promise.resolve();
+    return this.client.from('sr_state').upsert({ user_id:this.user.id, card_id:cardId, ease:sr.ease, interval_days:sr.interval_days, reps:sr.reps, lapses:sr.lapses, due_at:sr.due_at, last_reviewed:sr.last_reviewed }, { onConflict:'user_id,card_id' }).catch(function(e){ console.warn("saveSR failed", e); });
   }
 };
 function loadDashboard(){
@@ -325,6 +335,97 @@ function radarSVG(data){
   return '<svg viewBox="0 0 320 290" width="100%" style="max-width:360px;display:block;margin:0 auto">'+s+'</svg>';
 }
 
+/* ===== Flashbacks: spaced repetition (Phase 2) ===== */
+function flashSystems(){ var s={}; for(var i=0;i<DECK.length;i++) s[DECK[i].system]=1; return Object.keys(s).sort(); }
+function srSchedule(row, grade){
+  var ease=(row&&row.ease)||2.5, iv=(row&&row.interval_days)||0, reps=(row&&row.reps)||0, lapses=(row&&row.lapses)||0;
+  if(grade==="again"){ reps=0; lapses+=1; ease=Math.max(1.3,ease-0.20); iv=0; }
+  else if(grade==="hard"){ ease=Math.max(1.3,ease-0.15); iv=reps===0?1:Math.max(1,Math.round(iv*1.2)); reps+=1; }
+  else if(grade==="good"){ iv=reps===0?1:(reps===1?6:Math.round(iv*ease)); reps+=1; }
+  else { ease=ease+0.15; iv=reps===0?4:Math.round(iv*ease*1.3); reps+=1; }
+  var dueMs = grade==="again" ? Date.now()+5*60000 : Date.now()+iv*86400000;
+  return { ease:ease, interval_days:iv, reps:reps, lapses:lapses, due_at:new Date(dueMs).toISOString(), last_reviewed:new Date().toISOString() };
+}
+function srIntervalLabel(row, grade){
+  if(grade==="again") return "<5m";
+  var s=srSchedule(row,grade);
+  if(s.interval_days<1) return "<1d";
+  if(s.interval_days===1) return "1d";
+  if(s.interval_days<30) return s.interval_days+"d";
+  return Math.round(s.interval_days/30)+"mo";
+}
+function openFlash(){
+  state.flash={queue:[],idx:0,revealed:false,reviewed:0,system:"all",sr:{}};
+  state.screen="flash";
+  if(DB.loggedIn()){ DB.loadSR().then(function(map){ state.flash.sr=map||{}; render(); }); }
+  render();
+}
+function flashDueCount(system){ var now=Date.now(),sr=state.flash.sr,n=0; for(var i=0;i<DECK.length;i++){ var c=DECK[i]; if(system&&system!=="all"&&c.system!==system) continue; var row=sr[c.id]; if(row&&new Date(row.due_at).getTime()<=now) n++; } return n; }
+function flashNewCount(system){ var sr=state.flash.sr,n=0; for(var i=0;i<DECK.length;i++){ var c=DECK[i]; if(system&&system!=="all"&&c.system!==system) continue; if(!sr[c.id]) n++; } return n; }
+function flashSetSystem(){ var el=document.getElementById("flashSystem"); state.flash.system=el?el.value:"all"; render(); }
+function startReview(){
+  var system=state.flash.system||"all", now=Date.now(), sr=state.flash.sr, due=[], fresh=[];
+  for(var i=0;i<DECK.length;i++){ var c=DECK[i]; if(system!=="all"&&c.system!==system) continue; var row=sr[c.id]; if(row){ if(new Date(row.due_at).getTime()<=now) due.push(c.id); } else fresh.push(c.id); }
+  fresh=fresh.slice(0,20);
+  var queue=due.concat(fresh);
+  if(!queue.length) return;
+  state.flash.queue=queue; state.flash.idx=0; state.flash.revealed=false; state.flash.reviewed=0;
+  state.screen="review"; render();
+}
+function cardById(id){ for(var i=0;i<DECK.length;i++){ if(DECK[i].id===id) return DECK[i]; } return null; }
+function revealFlash(){ state.flash.revealed=true; render(); }
+function gradeCard(grade){
+  var f=state.flash, id=f.queue[f.idx]; if(!id) return;
+  var newrow=srSchedule(f.sr[id], grade);
+  f.sr[id]=newrow; f.reviewed++;
+  if(DB.loggedIn()) DB.saveSR(id,newrow);
+  if(grade==="again") f.queue.push(id);
+  f.idx++; f.revealed=false;
+  if(f.idx>=f.queue.length) state.screen="flashdone";
+  render();
+}
+function endFlash(){ state.screen="home"; render(); }
+function flashHTML(){
+  var systems=flashSystems(), sel=state.flash.system||"all";
+  var due=flashDueCount(sel), fresh=Math.min(20,flashNewCount(sel));
+  var opts='<option value="all"'+(sel==="all"?" selected":"")+'>All systems</option>'+systems.map(function(s){return '<option value="'+esc(s)+'"'+(sel===s?" selected":"")+'>'+esc(s)+'</option>';}).join("");
+  var guestNote = DB.loggedIn()? '' : '<p style="font-size:12px;color:var(--muted);margin-top:8px">Guest mode - this review runs locally and is not saved. Sign in to keep your schedule.</p>';
+  var canStart=(due+fresh)>0;
+  return '<div class="wrap">'
+   +'<div class="row"><div class="eyebrow">Flashbacks &middot; spaced repetition</div><button class="ghost" onclick="endFlash()">Back</button></div>'
+   +'<h1 style="font-size:30px;margin:10px 0 4px">Review session</h1>'
+   +'<p style="color:var(--muted)">Grade your recall on each card; the scheduler decides when you see it next.</p>'
+   +'<div class="card" style="padding:20px;margin-top:16px">'
+     +'<label class="eyebrow">Focus</label>'
+     +'<select id="flashSystem" class="input" style="margin:8px 0 14px" onchange="flashSetSystem()">'+opts+'</select>'
+     +'<div style="display:flex;gap:24px;margin-bottom:14px">'
+       +'<div><div class="serif" style="font-size:26px;color:var(--amber)">'+due+'</div><div style="font-size:12px;color:var(--muted)">due now</div></div>'
+       +'<div><div class="serif" style="font-size:26px;color:var(--primary)">'+fresh+'</div><div style="font-size:12px;color:var(--muted)">new this session</div></div>'
+     +'</div>'
+     +(canStart?'<button class="btn" style="width:100%" onclick="startReview()">Start review ('+(due+fresh)+' cards)</button>':'<p style="color:var(--muted);font-size:14px">Nothing due in this selection - try another system or come back later.</p>')
+     +guestNote
+   +'</div></div>';
+}
+function reviewHTML(){
+  var f=state.flash, c=cardById(f.queue[f.idx]);
+  if(!c) return '<div class="wrap"><p>Done.</p></div>';
+  var total=f.queue.length, pos=f.idx+1;
+  var head='<div class="wrap"><div class="row"><div class="eyebrow">Card '+pos+' of '+total+' &middot; reviewed '+f.reviewed+'</div><button class="ghost" onclick="endFlash()">End</button></div>';
+  var face='<div class="card" style="padding:24px;margin-top:14px"><div class="eyebrow" style="color:var(--primary)">'+esc(c.system)+' &middot; '+esc(c.topic)+'</div><div class="serif" style="font-size:20px;margin:10px 0 0;line-height:1.4">'+esc(c.front)+'</div>';
+  if(!f.revealed) return head+face+'</div><button class="btn" style="width:100%;margin-top:14px" onclick="revealFlash()">Show answer</button></div>';
+  var back='<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line);font-size:15px;line-height:1.6">'+esc(c.back)+'</div></div>';
+  var row=f.sr[c.id];
+  function gb(g,l,col){ return '<button class="ghost" style="flex:1;border-color:'+col+';color:'+col+'" onclick="gradeCard(\''+g+'\')">'+l+'<br><span style="font-size:11px;color:var(--muted)">'+srIntervalLabel(row,g)+'</span></button>'; }
+  var grades='<div style="display:flex;gap:8px;margin-top:14px">'+gb("again","Again","var(--incorrect)")+gb("hard","Hard","var(--amber)")+gb("good","Good","var(--primary)")+gb("easy","Easy","var(--correct)")+'</div>';
+  return head+face+back+grades+'</div>';
+}
+function flashDoneHTML(){
+  var f=state.flash;
+  return '<div class="wrap"><div class="eyebrow">Review complete</div>'
+   +'<h1 style="font-size:28px;margin:8px 0 4px">Nice work</h1>'
+   +'<p style="color:var(--muted)">You reviewed '+f.reviewed+' card'+(f.reviewed===1?"":"s")+' this session.'+(DB.loggedIn()?' Your schedule is saved - due cards will be waiting next time.':' Sign in to save your schedule between sessions.')+'</p>'
+   +'<div style="display:flex;gap:12px;margin-top:20px"><button class="btn" onclick="openFlash()">Review more</button><button class="ghost" onclick="endFlash()">Back to home</button></div></div>';
+}
 function loginHTML(){
   var sampleRadar=[{label:'Adult med',acc:78},{label:'Surgery',acc:64},{label:"Women's",acc:71},{label:'Child',acc:60},{label:'Mental',acc:82},{label:'Population',acc:55}];
   var seg=[{l:'Adult medicine',p:30,c:'#1F4E47'},{l:'Adult surgery',p:20,c:'#2C6E63'},{l:"Women's health",p:12.5,c:'#C99A3C'},{l:'Child health',p:12.5,c:'#D9B86A'},{l:'Mental health',p:12.5,c:'#A87E2C'},{l:'Population health',p:12.5,c:'#E8D6A6'}];
@@ -389,6 +490,7 @@ function homeHTML(){
    +'<div class="eyebrow" style="color:var(--primary)">Practice &amp; learn</div>'
    +'<h2 style="font-size:21px;margin:6px 0">Immediate feedback after every answer</h2>'
    +'<p style="color:var(--muted);font-size:14px">Full evidence-based explanation as you go, including why each wrong option is wrong. The system steers toward your weaker areas. Finish whenever you like.</p></div>'
+   +'<div class="card modecard" style="padding:22px;margin-top:14px" onclick="openFlash()">'+'<div class="eyebrow" style="color:var(--primary)">Flashbacks &middot; spaced repetition</div>'+'<h2 style="font-size:21px;margin:6px 0">Review high-yield cards on a smart schedule</h2>'+'<p style="color:var(--muted);font-size:14px">862 cards across 18 systems. Grade each recall and the scheduler brings cards back just before you would forget them.</p></div>'
    +'<p style="text-align:center;font-size:12px;color:var(--muted);margin-top:26px">Study content powered by ED AI Tutor</p>'
    +'</div>';
 }
@@ -496,6 +598,9 @@ function render(){
   else if(state.screen==="home"){app.innerHTML=homeHTML();animateMeters();if(DB.loggedIn())loadDashboard();}
   else if(state.screen==="run") app.innerHTML=runHTML();
   else if(state.screen==="results"){app.innerHTML=resultsHTML();animateMeters();}
+  else if(state.screen==="flash"){app.innerHTML=flashHTML();}
+  else if(state.screen==="review"){app.innerHTML=reviewHTML();}
+  else if(state.screen==="flashdone"){app.innerHTML=flashDoneHTML();}
 }
 function animateMeters(){ setTimeout(function(){ var els=document.querySelectorAll(".meter-fill"); els.forEach(function(el){el.style.width=el.getAttribute("data-w")+"%";}); },60); }
 function formatTime(s){if(s<0)s=0;var m=Math.floor(s/60),ss=s%60;return m+":"+(ss<10?"0":"")+ss;}
